@@ -5,6 +5,7 @@ from bedrock_agentcore.memory import MemoryClient
 import json
 import logging
 from datetime import datetime
+from utils.MemoryHookProvider import MemoryHookProvider
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -49,6 +50,12 @@ Be concise but comprehensive. Use clear sections and prioritize the most critica
                 self.generate_digest_section,
             ],
             system_prompt=self.system_prompt,
+            hooks=[
+                MemoryHookProvider(
+                    memory_client=MemoryClient(), memory_id="digest_memory"
+                )
+            ],
+            state={"actor_id": "digest_agent", "session_id": "daily_digest_session"},
         )
 
     @tool
