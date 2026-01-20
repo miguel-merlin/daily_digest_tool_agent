@@ -1,41 +1,46 @@
-# Data Flow & Logic Architecture
+# Data Flow Architecture: EverCurrent Daily Digest
 
-This document details the movement of information from raw Slack dumps to personalized insights, utilizing Parallelization and Routing patterns.
+This document outlines the end-to-end data flow within the EverCurrent ecosystem, covering ingestion, authentication, personalization, inference, and observability.
 
-## Phase 1: Ingestion & Routing (The Filter)
-* **Pattern:** **Parallelization** & **Routing**.
-* **Input:** Batch JSON export of daily Slack channels (`#mechanical`, `#electrical`, `#supply-chain`, `#general`).
-* **Step 1.1 (Sanitization):** Raw text passes through **Bedrock Guardrails** to redact PII and filter unrelated "watercooler" chat.
-* **Step 1.2 (Topic Extraction):** The **Ingestion Agent** scans threads.
-    * *Logic:* "Does this thread contain a Decision, a Risk, or an FYI?"
-* **Step 1.3 (Routing):** Based on the topic, the thread is routed to a Domain Worker.
-    * *Example:* "Thermal paste spec change" -> Routes to **Mechanical Expert**.
-    * *Example:* "Chipset lead time delay" -> Routes to **Supply Chain Expert**.
+## 1. Asynchronous Data Ingestion (Knowledge Pipeline)
+Before user interaction occurs, the system continuously aggregates knowledge from corporate sources to ensure the agent has access to the latest data.
 
-## Phase 2: Synthesis & Contextualization (The Reasoning)
-* **Pattern:** **Reasoning Techniques** & **RAG**.
-* **Actor:** Domain Worker Agents (Mechanical, Electrical, etc.).
-* **Process:**
-    1.  **Retrieve:** Agent queries **Bedrock Knowledge Base** for context. (e.g., "What is the 'DVT Phase' requirement for thermal throttling?").
-    2.  **Reason:** Agent evaluates the Slack thread against the retrieved context.
-    3.  **Summarize:** Generates a structured "Knowledge Nugget" (JSON) containing: ` { "topic": "Thermal", "severity": "High", "summary": "...", "impact": "Production Delay" }`.
+* **Source:** Slack Workspaces and Company Documentation (e.g., Wikis, Drive).
+* **Transport:** An AWS Lambda function triggers via a Cron Job to fetch relevant messages and documents.
+* **Storage:** Raw data is stored in specific **Amazon S3** buckets ("Slack Messages" and "Company Docs").
+* **Indexing:** **Amazon Bedrock Knowledge Base** ingests the data from S3, chunking and embedding it into **Amazon OpenSearch** to enable semantic retrieval.
 
-## Phase 3: Personalization (The Lens)
-* **Pattern:** **Memory Management** & **Prioritization**.
-* **Trigger:** User (e.g., "Sarah, Eng Manager") requests a digest via the UI.
-* **Step 3.1 (Profile Load):** System loads "Sarah's" active persona from **DynamoDB**.
-    * *Attributes:* `Role: Manager`, `Focus: Timeline`, `Technical_Depth: Low`.
-* **Step 3.2 (Relevance Scoring):** The **Personalization Agent** scores every "Knowledge Nugget" against Sarah's profile.
-    * *Logic:* "Sarah cares about 'Production Delay' (Score 0.95). She does not care about 'Variable Renaming in Code' (Score 0.10)."
+## 2. User Authentication & Session Initialization
+When a user initiates a session to request a digest:
 
-## Phase 4: Reflection & Refinement (The Polishing)
-* **Pattern:** **Reflection**.
-* **Actor:** The **Critic Agent**.
-* **Action:** Reads the draft digest.
-    * *Self-Correction:* "The draft mentions 'thermal throttling' without context. Sarah is a Manager, not an Analyst. Rewrite to explain the *business impact* of the throttling."
-* **Output:** Final Markdown Digest delivered to the Streamlit UI.
+1.  **Identity Verification:** The user authenticates via **Amazon Cognito**, which integrates with **AgentCore Identity** to validate access rights.
+2.  **Context Loading:** Upon successful auth, the **AgentCore Runtime** initializes the **Daily Digest Agent**. It retrieves the session history and previous interaction context from **AgentCore Memory** to maintain conversation continuity.
 
-## Phase 5: Feedback Loop (The Learning)
-* **Pattern:** **Learning and Adaptation** & **Human-in-the-Loop**.
-* **Action:** Sarah clicks "Mark as Irrelevant" on a specific item.
-* **Result:** System updates Sarah's vector profile in memory to down-weight similar topics in the future.
+## 3. Personalization & Context Retrieval (AgentCore Gateway)
+To generate a *personalized* digest, the agent must first understand the specific employee's role and current focus.
+
+1.  **Tool Invocation:** The Daily Digest Agent calls the **AgentCore Gateway**.
+2.  **Profile Retrieval:** The Gateway triggers the `get_customer_profile()` tool (a sub-agent specialized in retrieval).
+3.  **Data Access:** This tool accesses the persistent `Employee.md` file stored in **Amazon S3** via an AWS Lambda function.
+4.  **Context Return:** The tool returns the employee's specific profile (e.g., "Mechanical Engineer," "Focus: Actuators") to the main agent.
+
+## 4. Query Execution & Inference
+With the user's profile context established, the agent generates the digest.
+
+1.  **Knowledge Retrieval:** The agent invokes `get_messages()` and `read_docs()`.
+    * These tools query the **Amazon Bedrock Knowledge Base**.
+    * **Amazon OpenSearch** performs a vector search to find Slack messages and docs relevant to the user's specific profile context.
+2.  **LLM Inference:** The retrieved context and user query are sent to **Amazon Bedrock LLMs** for processing and answer generation.
+3.  **Safety Layer:** The raw model output is passed through **Amazon Guardrails** to filter hallucinations, toxicity, or PII before being returned to the runtime.
+
+## 5. Profile Evolution (Learning Loop)
+The system dynamically updates its understanding of the user based on the interaction.
+
+1.  **Analysis:** If the user interaction reveals new priorities or role changes, the agent invokes the **AgentCore Gateway**.
+2.  **Profile Update:** The Gateway triggers the `write_employee_info()` tool (a sub-agent).
+3.  **Persistence:** An AWS Lambda function updates the specific `Employee.md` file in **Amazon S3**, ensuring the next session is even more personalized.
+
+## 6. Observability
+Throughout the entire lifecycle, the **AgentCore Runtime** emits telemetry data.
+
+* **Tracing:** Agent traces (inputs, outputs, latency, tool usage) are sent to **AgentCore Observability** for monitoring system health and debugging.

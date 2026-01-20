@@ -1,59 +1,58 @@
-# Component Details: Agentic Implementation
+# Component Deep Dive: EverCurrent Daily Digest Architecture
 
-## A. The Agents (LangGraph Nodes)
+## 1. AgentCore Runtime & Daily Digest Agent
+The **AgentCore Runtime** acts as the central orchestration engine for the system, hosting the **Daily Digest Agent** (a LangChain-based entity). It is responsible for session management, tool routing, and maintaining the cognitive loop of the application.
 
-### 1. `OrchestratorAgent` (The Supervisor)
-* **Role:** The "Brain" that manages state and hands off tasks.
-* **Implementation:** A LangGraph `StateGraph` root node.
-* **Key Function:** Maintains the `GlobalState` (list of messages, list of nuggets, current user context).
+* **Low-Level Functionality:**
+    * **Session Initialization:** Upon a user request, the runtime initializes a new agent instance. It pulls strictly scoped session data from **AgentCore Memory** to hydrate the agent's context window with previous interaction history.
+    * **ReAct Loop:** The agent operates on a ReAct (Reasoning + Acting) loop. It analyzes the user's request (e.g., "What happened in the Actuator project today?"), determines which tools to call (`get_messages`, `read_docs`, or `get_customer_profile`), and iterates until a sufficient answer is constructed.
+    * **State Management:** The runtime manages the transient state of the conversation, ensuring that tool outputs are correctly fed back into the LLM's context window for subsequent reasoning steps.
 
-### 2. `DomainExperts` (Worker Agents)
-* **Variants:** `MechanicalAgent`, `ElectricalAgent`, `SupplyChainAgent`.
-* **Configuration:**
-    * **Prompt:** Specialized system prompts (e.g., "You are a Senior ME. Focus on tolerances, materials, and thermal issues.").
-    * **Tools:** `VectorSearchTool` (to look up specs), `TavilySearch` (Optional - to check external vendor status).
-    * **Model:** Claude 3.5 Sonnet (via LiteLLM) for high-reasoning capability.
+* **Bottlenecks & Trade-offs:**
+    * **Latency:** The sequential nature of the ReAct loop (Think $\rightarrow$ Act $\rightarrow$ Observe $\rightarrow$ Think) introduces latency. Each tool call requires a round-trip to an external service and a subsequent LLM inference step.
+    * **Context Window Limits:** While LLMs have large context windows, hydrating the agent with extensive long-term memory and retrieved documents can lead to context exhaustion or "lost in the middle" phenomena.
+    * **Trade-off:** We prioritize **accuracy** over **speed** here. By allowing the agent to reason iteratively, we reduce hallucinations, even though it results in a slower time-to-first-token compared to a simple RAG (Retrieval-Augmented Generation) chain.
 
-### 3. `PersonaManager` (Memory Agent)
-* **Role:** Manages the "Digital Twin" of the user.
-* **Pattern:** **Model Context Protocol** for standardizing how user context is injected into prompts.
-* **Data Store:** JSON blobs in Postgres/DynamoDB (mapped to `user_id`).
-    * *Structure:* `{ "user_id": "123", "current_phase": "EVT", "high_priority_keywords": ["risk", "delay", "budget"], "low_priority_keywords": ["lunch", "typo"] }`
+## 2. AgentCore Gateway (Dynamic Profiling Engine)
+This is the system's core innovation. Unlike static SQL databases for user profiles, the **AgentCore Gateway** manages two specialized sub-agents that interface with unstructured Markdown (`.md`) files stored in S3.
 
-### 4. `CriticAgent` (Quality Control)
-* **Role:** The final editor.
-* **Pattern:** **Guardrails** + **Reflection**.
-* **Logic:**
-    1.  Check for hallucinations (Verify facts against the raw Slack thread).
-    2.  Tone check (Ensure professional, concise language).
-    3.  Safety check (Double-check PII redaction).
+### A. `write_employee_info()` Agent
+* **Function:** This sub-agent parses user interactions to extract implicit signals about changing priorities (e.g., a user shifting focus from "battery thermal management" to "supply chain logistics").
+* **Mechanism:** It invokes a Lambda function to append or rewrite sections of the `Employee.md` file.
+* **Concurrency Handling:** The Lambda must handle potential write conflicts if a user generates multiple signals rapidly, likely using S3 versioning or optimistic locking strategies.
 
-## B. The Mock User Interface (Streamlit)
+### B. `get_customer_profile()` Agent
+* **Function:** Before the main digest generation, this agent reads the `Employee.md` file to construct a "system prompt injection" containing the user's persona.
+* **Mechanism:** It uses a Lambda to fetch the file from S3.
 
-**Location:** `cx-agent-frontend/src/app.py`
-**Purpose:** Since we cannot integrate with live Slack for the demo, this UI serves as the "Simulation Console."
+* **Bottlenecks & Trade-offs:**
+    * **Cold Starts:** The Lambda functions triggering these tools may experience cold starts, adding ~100-500ms latency to the initial tool call.
+    * **Trade-off (Unstructured vs. Structured Data):** Storing profiles in Markdown (`.md`) rather than a database allows the LLM to store flexible, nuanced natural language notes about the user (e.g., "User prefers concise bullet points"). The trade-off is higher query latency and lack of strict schema validation compared to a DynamoDB or PostgreSQL lookup.
 
-* **Left Panel (Scenario Setup):**
-    * **"Persona Creator":** Create a new user (Role, Focus, Seniority).
-    * **"Project Phase Slider":** Move project from "Concept" -> "Prototyping" -> "Production" (Changes agent prioritization weights).
-* **Center Panel (Chat/Digest):**
-    * **"Inject Mock Data":** Button to load pre-set complex Slack threads (e.g., "The 'Missing Screw' Crisis").
-    * **"Generate Digest":** Triggers the Agentic Workflow.
-* **Right Panel (Debug/Trace):**
-    * **"Thought Process":** Displays the Langfuse trace ID and a simplified view of the agent's reasoning (e.g., "Filtered out 'Lunch order' thread because relevance < 0.2").
+## 3. Data Ingestion Pipeline (The Knowledge Backbone)
+The system relies on an asynchronous "Extract, Load, Index" (ELI) pipeline to keep the knowledge base fresh without blocking user requests.
 
-## C. Infrastructure Integration
+* **Components:**
+    * **Cron Job (Lambda):** A scheduled Lambda function polls Slack APIs and Company Documentation repositories.
+    * **Raw Storage (S3):** Raw JSON/Text data is dumped into S3 buckets ("Slack Messages" & "Company Docs").
+    * **Indexing (Bedrock Knowledge Base):** Amazon Bedrock manages the ingestion from S3, chunking the text (e.g., recursive character split), creating vector embeddings, and updating the OpenSearch index.
 
-**1. LiteLLM Gateway**
-* **Purpose:** Centralized governance for model access.
-* **Configuration:**
-    * `master_key`: Uses the key provided config.
-    * `model_routing`: Configured to route `model="fast"` to Haiku and `model="reasoning"` to Sonnet.
+* **Bottlenecks & Trade-offs:**
+    * **Data Freshness (Eventual Consistency):** Since this is a cron-based system (not real-time streaming), there is a lag between a Slack message being posted and it appearing in the digest.
+    * **Trade-off:** We sacrifice **real-time** availability for **architectural simplicity** and **cost efficiency**. A real-time stream would require managing WebSocket connections or Kinesis streams, significantly increasing complexity for a "Daily Digest" use case where sub-second freshness is rarely critical.
 
-**2. Observability (Langfuse)**
-* **Integration:** The `OrchestratorAgent` is wrapped with the Langfuse Python SDK.
-* **Metric:** We track "Hallucination Rate" (via user feedback) and "Processing Latency" per digest.
+## 4. Retrieval & Inference Layer
+* **Amazon OpenSearch (Vector Database):** Acts as the retrieval engine. It performs semantic search (KNN/ANN) to find messages relevant to the query.
+* **Amazon Bedrock LLMs:** The core inference engine. It takes the retrieved context + user profile + user query to generate the final response.
 
-**3. Knowledge Base (Bedrock)**
-* **Ingestion:** We use the `aws bedrock-agent start-ingestion-job` (from Step 4a in docs) to index the PDF specifications of the robot.
-* **Usage:** When a Slack message mentions a part number, the agent queries this KB to find the part name and importance.
+* **Bottlenecks & Trade-offs:**
+    * **Retrieval Precision:** "Garbage in, garbage out." If the OpenSearch index returns irrelevant Slack threads, the LLM will fail to generate a useful digest.
+    * **Trade-off:** Using a managed service (Bedrock Knowledge Base) reduces operational overhead but limits control over low-level indexing parameters (like specific HNSW graph settings) compared to managing a raw OpenSearch cluster.
+
+## 5. Safety & Governance (Amazon Guardrails)
+* **Post-Inference Guardrails:** Situated strictly *after* the LLM inference but *before* the response reaches the user.
+* **Function:** It scans the generated text for PII (Personally Identifiable Information), toxicity, and hallucination patterns (checking if the output is grounded in the retrieved context).
+
+* **Bottlenecks & Trade-offs:**
+    * **Latency Penalty:** This adds a final processing step, increasing end-to-end latency.
+    * **False Positives:** Aggressive guardrails might filter out legitimate technical discussions (e.g., discussing "killing a process" in a Linux context might be flagged as violence by a poorly tuned model).
